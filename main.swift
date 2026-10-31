@@ -391,6 +391,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             try await Updater.install(update)
             relaunch()
         } catch {
+            NSLog("CmdE update check failed: \(error)")
             if userInitiated { showAlert("Couldn't update CmdE", error.localizedDescription) }
         }
     }
