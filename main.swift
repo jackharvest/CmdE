@@ -89,11 +89,121 @@ final class HotKey {
     }
 }
 
+// MARK: - Updates
+
+// Same shape as Marquee's AppUpdater: read the latest GitHub release, download its "-app.zip"
+// asset, swap it in for the running bundle. Every release MUST publish exactly one such asset
+// with CmdE.app at its root (release.sh builds it) or there's nothing to install.
+struct AppUpdate {
+    let version: String
+    let assetURL: URL
+    let notes: String
+}
+
+enum UpdateError: LocalizedError {
+    case malformedRelease, invalidDownload, notInApplications
+
+    var errorDescription: String? {
+        switch self {
+        case .malformedRelease: return "Couldn't read the latest release."
+        case .invalidDownload: return "The downloaded update wasn't a valid copy of CmdE."
+        case .notInApplications: return "Move CmdE to your Applications folder to update it."
+        }
+    }
+}
+
+enum Updater {
+    private static let latestReleaseURL = URL(string: "https://api.github.com/repos/jackharvest/CmdE/releases/latest")!
+
+    static var currentVersion: String {
+        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.0.0"
+    }
+
+    // Updating (and the login item) only make sense for a real install. A build folder or a copy
+    // running straight from the DMG shouldn't replace itself.
+    static var isInstalled: Bool {
+        Bundle.main.bundlePath.hasPrefix("/Applications/")
+    }
+
+    static func latestRelease() async throws -> AppUpdate {
+        var request = URLRequest(url: latestReleaseURL, cachePolicy: .reloadIgnoringLocalCacheData)
+        request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        let (data, _) = try await URLSession.shared.data(for: request)
+        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let tag = json["tag_name"] as? String,
+              let assets = json["assets"] as? [[String: Any]],
+              let asset = assets.first(where: { ($0["name"] as? String)?.hasSuffix("-app.zip") == true }),
+              let urlString = asset["browser_download_url"] as? String,
+              let url = URL(string: urlString)
+        else { throw UpdateError.malformedRelease }
+        return AppUpdate(version: tag.hasPrefix("v") ? String(tag.dropFirst()) : tag, assetURL: url, notes: json["body"] as? String ?? "")
+    }
+
+    // Numeric compare, since a string compare would sort "1.10" before "1.2".
+    static func isNewer(_ version: String) -> Bool {
+        let new = version.split(separator: ".").compactMap { Int($0) }
+        let old = currentVersion.split(separator: ".").compactMap { Int($0) }
+        for i in 0..<max(new.count, old.count) {
+            let a = i < new.count ? new[i] : 0
+            let b = i < old.count ? old[i] : 0
+            if a != b { return a > b }
+        }
+        return false
+    }
+
+    static func install(_ update: AppUpdate) async throws {
+        guard isInstalled else { throw UpdateError.notInApplications }
+
+        let (download, _) = try await URLSession.shared.download(from: update.assetURL)
+        let workDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: workDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: workDir) }
+
+        let zip = workDir.appendingPathComponent("update.zip")
+        try FileManager.default.moveItem(at: download, to: zip)
+        guard run("/usr/bin/ditto", "-x", "-k", zip.path, workDir.path) else { throw UpdateError.invalidDownload }
+
+        // Nothing is left to catch a bad bundle once it's in place, and a version mismatch would
+        // reinstall the same release on every check, so refuse anything that isn't exactly this.
+        let newApp = workDir.appendingPathComponent("CmdE.app")
+        guard let info = Bundle(url: newApp)?.infoDictionary,
+              info["CFBundleIdentifier"] as? String == Bundle.main.bundleIdentifier,
+              info["CFBundleShortVersionString"] as? String == update.version,
+              run("/usr/bin/codesign", "--verify", "--deep", newApp.path)
+        else { throw UpdateError.invalidDownload }
+
+        // The old copy moves aside rather than being deleted, so a failed swap can roll back.
+        let current = Bundle.main.bundleURL
+        let backup = current.deletingLastPathComponent().appendingPathComponent(".CmdE-preupdate.bak")
+        try? FileManager.default.removeItem(at: backup)
+        try FileManager.default.moveItem(at: current, to: backup)
+        do {
+            try FileManager.default.moveItem(at: newApp, to: current)
+        } catch {
+            try? FileManager.default.removeItem(at: current)
+            try? FileManager.default.moveItem(at: backup, to: current)
+            throw error
+        }
+        try? FileManager.default.removeItem(at: backup)
+    }
+
+    private static func run(_ path: String, _ arguments: String...) -> Bool {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: path)
+        process.arguments = arguments
+        guard (try? process.run()) != nil else { return false }
+        process.waitUntilExit()
+        return process.terminationStatus == 0
+    }
+}
+
 // MARK: - Settings
 
 enum AppSettings {
     private static let enabledKey = "enabled"
     private static let loginItemOfferedKey = "loginItemOffered"
+    private static let autoUpdateKey = "autoUpdate"
+    private static let lastUpdateCheckKey = "lastUpdateCheck"
 
     static var enabled: Bool {
         get {
@@ -107,17 +217,35 @@ enum AppSettings {
         get { UserDefaults.standard.bool(forKey: loginItemOfferedKey) }
         set { UserDefaults.standard.set(newValue, forKey: loginItemOfferedKey) }
     }
+
+    static var autoUpdate: Bool {
+        get {
+            if UserDefaults.standard.object(forKey: autoUpdateKey) == nil { return true }
+            return UserDefaults.standard.bool(forKey: autoUpdateKey)
+        }
+        set { UserDefaults.standard.set(newValue, forKey: autoUpdateKey) }
+    }
+
+    static var lastUpdateCheck: Date? {
+        get { UserDefaults.standard.object(forKey: lastUpdateCheckKey) as? Date }
+        set { UserDefaults.standard.set(newValue, forKey: lastUpdateCheckKey) }
+    }
 }
 
 // MARK: - App delegate
 
+@MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
     private let hotKey = HotKey()
+    private var updateTimer: Timer?
+    private var isUpdating = false
 
     private let statusLine = NSMenuItem(title: "", action: nil, keyEquivalent: "")
     private let enabledItem = NSMenuItem(title: "Enabled", action: #selector(toggleEnabled), keyEquivalent: "")
     private let loginItem = NSMenuItem(title: "Launch at Login", action: #selector(toggleLoginItem), keyEquivalent: "")
+    private let checkUpdatesItem = NSMenuItem(title: "Check for Updates…", action: #selector(checkForUpdates), keyEquivalent: "")
+    private let autoUpdateItem = NSMenuItem(title: "Install Updates Automatically", action: #selector(toggleAutoUpdate), keyEquivalent: "")
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         if let button = statusItem.button {
@@ -127,13 +255,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         buildMenu()
         hotKey.onPress = { [weak self] in self?.openFinderWindow() }
         refresh()
+        startUpdateChecks()
     }
 
     // A hotkey that silently stops working after a reboot is the one way this app can feel
     // broken, so it starts as a login item once. Only from /Applications: a login item
     // registered from a build folder would point at a path that later disappears.
     private func enableLoginItemOnFirstRun() {
-        guard !AppSettings.loginItemOffered, Bundle.main.bundlePath.hasPrefix("/Applications/") else { return }
+        guard !AppSettings.loginItemOffered, Updater.isInstalled else { return }
         AppSettings.loginItemOffered = true
         try? SMAppService.mainApp.register()
     }
@@ -152,6 +281,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         loginItem.target = self
         menu.addItem(loginItem)
+        autoUpdateItem.target = self
+        autoUpdateItem.state = AppSettings.autoUpdate ? .on : .off
+        menu.addItem(autoUpdateItem)
+        checkUpdatesItem.target = self
+        menu.addItem(checkUpdatesItem)
         menu.addItem(.separator())
 
         menu.addItem(withTitle: "☕ Buy Me a Coffee", action: #selector(openBuyMeACoffee), keyEquivalent: "").target = self
@@ -202,6 +336,97 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             alert.informativeText = message
             NSApp.activate(ignoringOtherApps: true)
             alert.runModal()
+        }
+    }
+
+    // CmdE runs for weeks at a time as a login item, so checking only at launch would never
+    // find anything. The hourly tick is just a retry for sleep and being offline: a real check
+    // happens once a day, and only a successful one counts.
+    private func startUpdateChecks() {
+        guard Updater.isInstalled else { return }
+        updateTimer = Timer.scheduledTimer(withTimeInterval: 3600, repeats: true) { [weak self] _ in
+            Task { @MainActor in await self?.checkIfDue() }
+        }
+        Task { await checkIfDue() }
+    }
+
+    private func checkIfDue() async {
+        if let last = AppSettings.lastUpdateCheck, Date().timeIntervalSince(last) < 24 * 3600 { return }
+        await runUpdateCheck(userInitiated: false)
+    }
+
+    @objc private func checkForUpdates() {
+        Task { await runUpdateCheck(userInitiated: true) }
+    }
+
+    @objc private func toggleAutoUpdate() {
+        AppSettings.autoUpdate = autoUpdateItem.state != .on
+        autoUpdateItem.state = AppSettings.autoUpdate ? .on : .off
+    }
+
+    // The background path never shows an alert, since this can fire in the middle of a game. A
+    // failed background check looks the same as being up to date; with automatic installs off,
+    // a new version only shows up as the menu item's title.
+    private func runUpdateCheck(userInitiated: Bool) async {
+        guard !isUpdating else { return }
+        isUpdating = true
+        defer { isUpdating = false }
+
+        do {
+            let update = try await Updater.latestRelease()
+            AppSettings.lastUpdateCheck = Date()
+
+            guard Updater.isNewer(update.version) else {
+                checkUpdatesItem.title = "Check for Updates…"
+                if userInitiated { showAlert("You're up to date", "CmdE \(Updater.currentVersion) is the latest version.") }
+                return
+            }
+            if userInitiated {
+                guard confirmUpdate(update) else { return }
+            } else if !AppSettings.autoUpdate {
+                checkUpdatesItem.title = "Update to \(update.version)…"
+                return
+            }
+
+            try await Updater.install(update)
+            relaunch()
+        } catch {
+            if userInitiated { showAlert("Couldn't update CmdE", error.localizedDescription) }
+        }
+    }
+
+    private func confirmUpdate(_ update: AppUpdate) -> Bool {
+        let alert = NSAlert()
+        alert.messageText = "CmdE \(update.version) is available"
+        alert.informativeText = update.notes.isEmpty ? "You're on \(Updater.currentVersion)." : String(update.notes.prefix(500))
+        alert.addButton(withTitle: "Update & Relaunch")
+        alert.addButton(withTitle: "Later")
+        NSApp.activate(ignoringOtherApps: true)
+        return alert.runModal() == .alertFirstButtonReturn
+    }
+
+    private func showAlert(_ title: String, _ message: String) {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = message
+        NSApp.activate(ignoringOtherApps: true)
+        alert.runModal()
+    }
+
+    // ⌘E has to be released first: the new copy starts while this one is still running, and only
+    // one process can hold a hotkey, so it would come up reporting ⌘E as taken.
+    private func relaunch() {
+        hotKey.unregister()
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.createsNewApplicationInstance = true
+        NSWorkspace.shared.openApplication(at: Bundle.main.bundleURL, configuration: configuration) { _, error in
+            DispatchQueue.main.async {
+                if error == nil {
+                    NSApp.terminate(nil)
+                } else {
+                    self.refresh()
+                }
+            }
         }
     }
 
@@ -281,7 +506,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 }
 
 let app = NSApplication.shared
-let delegate = AppDelegate()
+let delegate = MainActor.assumeIsolated { AppDelegate() }
 app.delegate = delegate
 app.setActivationPolicy(.accessory)
 app.run()

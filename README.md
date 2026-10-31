@@ -55,6 +55,8 @@ Click the folder icon in the menu bar for everything else:
 - **New Finder Window** - the same thing as pressing ⌘E.
 - **Enabled** - claims or releases ⌘E instantly. Turn it off and ⌘E goes straight back to whichever app you're using.
 - **Launch at Login** - on by default the first time you open CmdE from Applications, since a hotkey is only useful if it's always running. Uncheck it and it stays off.
+- **Install Updates Automatically** - on by default. CmdE checks GitHub once a day and installs new versions quietly in the background, with no popups. Turn it off and a new version only appears as an **Update to x.y.z…** item in this menu.
+- **Check for Updates…** - checks right now and asks before installing.
 - **Uninstall CmdE…** - releases ⌘E, removes the login item, clears saved settings and the Finder permission, and moves CmdE.app to the Trash (recoverable until you empty it).
 - **Quit CmdE** - exits without uninstalling.
 
@@ -73,7 +75,7 @@ CmdE registers ⌘E with `RegisterEventHotKey`, the classic Carbon global hotkey
 
 ## Releasing
 
-`./release.sh` builds the app and packages it into a DMG (`CmdE-x.y.z.dmg`) with the custom background in `scripts/dmg_background.png` and a drag-to-Applications layout, via [dmgbuild](https://github.com/dmgbuild/dmgbuild) (`pip3 install --user dmgbuild`). Bump `CFBundleShortVersionString` in `Info.plist` first.
+`./release.sh` builds the app and packages it into a DMG (`CmdE-x.y.z.dmg`) with the custom background in `scripts/dmg_background.png` and a drag-to-Applications layout, via [dmgbuild](https://github.com/dmgbuild/dmgbuild) (`pip3 install --user dmgbuild`). It also creates `CmdE-x.y.z-app.zip`, which is what the in-app updater installs. Bump `CFBundleShortVersionString` in `Info.plist` first, then attach **both** files to a release tagged `vx.y.z`.
 
 ## FAQ
 
@@ -87,7 +89,7 @@ While CmdE is enabled, it owns ⌘E system-wide, so apps stop receiving it. That
 No. It only needs Automation permission for Finder, and it never sees your other keystrokes.
 
 **Is CmdE safe to run? Does it send any data anywhere?**
-CmdE has no network code at all. Its only outside link is the Buy Me a Coffee menu item, which opens in your browser if you click it. Read `main.swift`; the entire app is a few hundred lines.
+CmdE's only network traffic is the update check: once a day it reads this repo's latest release from the GitHub API, and it downloads the new version from there when there is one. Nothing about you or your Mac is sent. Read `main.swift`; the entire app is a few hundred lines.
 
 **I clicked Don't Allow on the Finder prompt.**
 Press ⌘E again and CmdE will offer to open **System Settings > Privacy & Security > Automation**, where you can turn Finder on under CmdE.

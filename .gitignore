@@ -4,6 +4,7 @@ scripts/make_dmg_background
 scripts/icon.iconset/
 dmg-staging/
 *.dmg
+*-app.zip
 .DS_Store
 *.o
 .build/
