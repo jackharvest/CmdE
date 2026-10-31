@@ -1,0 +1,10 @@
+CmdE.app/
+scripts/make_icon
+scripts/make_dmg_background
+scripts/icon.iconset/
+dmg-staging/
+*.dmg
+.DS_Store
+*.o
+.build/
+STATUS.md
